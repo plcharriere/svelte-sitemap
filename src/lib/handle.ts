@@ -135,6 +135,23 @@ export type SitemapHandle = Handle & {
 	 * endpoint after content changes.
 	 */
 	invalidate: (group?: string) => Promise<void>;
+	/**
+	 * Proactively rebuild the cache — run every resolver, write fresh chunks and
+	 * meta — without waiting for a request. Where `invalidate()` only marks the
+	 * cache stale and lets the next request pay the rebuild cost, `rebuild()`
+	 * does the work itself, so requests afterwards hit a warm cache.
+	 *
+	 * Intended for a scheduled job (cron) so slow resolvers never block a
+	 * request. It runs without a request context, so it can't infer the origin:
+	 * set `config.siteUrl`, or pass `{ siteUrl }`. Pass `{ group }` to rebuild a
+	 * single group. Rejects with an `AggregateError` if any group's resolvers
+	 * throw — groups that succeeded are still committed.
+	 *
+	 * Only meaningful with an external cache adapter: the in-process cache isn't
+	 * shared across serverless instances, so warming it from a cron job wouldn't
+	 * reach the instances serving requests.
+	 */
+	rebuild: (options?: { siteUrl?: string; group?: string }) => Promise<void>;
 };
 
 export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
@@ -250,6 +267,50 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 				);
 			}
 			await store.invalidate(group !== undefined ? [group] : knownGroups);
+		},
+		rebuild: async (
+			options: { siteUrl?: string; group?: string } = {}
+		): Promise<void> => {
+			if (options.siteUrl !== undefined) {
+				try {
+					new URL(options.siteUrl);
+				} catch {
+					throw new Error(
+						`[sitemap] rebuild: siteUrl "${options.siteUrl}" is not a valid URL.`
+					);
+				}
+			}
+			const root = options.siteUrl ?? staticSiteUrl;
+			if (!root) {
+				throw new Error(
+					'[sitemap] rebuild() runs without a request, so it cannot infer the ' +
+						'origin — set config.siteUrl or pass { siteUrl } to rebuild().'
+				);
+			}
+			if (options.group !== undefined && !knownGroups.has(options.group)) {
+				throw new Error(
+					`[sitemap] rebuild: unknown group "${options.group}". Known groups: ${[...knownGroups]
+						.map((g) => (g === DEFAULT_GROUP ? '(default)' : g))
+						.join(', ')}.`
+				);
+			}
+			// Same siteUrl composition as the request path: (origin) + base.
+			const siteUrl = root.replace(/\/$/, '') + base;
+			const build = (groups: Set<string>): Promise<GroupedEntries> =>
+				buildEntries({ siteUrl, base, config, excludeMatchers, lastmodPrecision }, groups);
+			const targets = options.group !== undefined ? [options.group] : [...knownGroups];
+			const results = await Promise.allSettled(
+				targets.map((g) => store.rebuildGroup(g, siteUrl, build, maxEntries))
+			);
+			const rejected = results.filter(
+				(r): r is PromiseRejectedResult => r.status === 'rejected'
+			);
+			if (rejected.length > 0) {
+				throw new AggregateError(
+					rejected.map((r) => r.reason),
+					`[sitemap] rebuild: ${rejected.length}/${targets.length} group(s) failed.`
+				);
+			}
 		}
 	});
 }

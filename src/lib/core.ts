@@ -750,9 +750,12 @@ export class SitemapStore {
 
 	/**
 	 * Rebuild a single group: run only that group's resolvers, write its chunks,
-	 * commit its meta. Other groups' caches are completely untouched.
+	 * commit its meta. Other groups' caches are completely untouched. Public so
+	 * the handle's `rebuild()` can drive it proactively (e.g. from a cron job),
+	 * not only lazily on a cache miss. The inflight dedup means a proactive
+	 * rebuild and a request-triggered one for the same group share the work.
 	 */
-	private rebuildGroup(
+	rebuildGroup(
 		group: string,
 		siteUrl: string,
 		build: GroupBuild,

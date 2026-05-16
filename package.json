@@ -1,7 +1,7 @@
 {
 	"name": "@plcharriere/svelte-sitemap",
 	"version": "0.1.0",
-	"description": "Auto-discovering sitemap.xml for SvelteKit 2 + Svelte 5. One handle hook + one Vite plugin, with route discovery, dynamic resolvers, chunked sitemap-index, and in-memory caching.",
+	"description": "sitemap.xml for SvelteKit 2 + Svelte 5 — route discovery, chunking, caching.",
 	"keywords": [
 		"svelte",
 		"sveltekit",
@@ -9,7 +9,6 @@
 		"sitemap.xml",
 		"seo",
 		"xml",
-		"vite-plugin",
 		"typescript"
 	],
 	"license": "MIT",

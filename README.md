@@ -1,6 +1,6 @@
 # svelte-sitemap
 
-Auto-discovering, chunked, cached `sitemap.xml` for **SvelteKit 2 + Svelte 5**. One Vite plugin scans your routes, one `handle` hook serves the XML — static routes appear automatically, dynamic routes (`/blog/[id]`) ask you for the IDs, and once you cross `maxEntries` URLs (default 50K, the protocol max) `/sitemap.xml` becomes a `<sitemapindex>` pointing at chunked sub-sitemaps.
+`sitemap.xml` for **SvelteKit 2 + Svelte 5**. A `handle` hook serves the XML; an optional Vite plugin discovers your routes. Static routes appear automatically, dynamic routes (`/blog/[id]`) take a resolver for their IDs, and past `maxEntries` URLs (default 50K, the protocol max) `/sitemap.xml` becomes a `<sitemapindex>` pointing at chunked sub-sitemaps.
 
 ```ts
 // src/hooks.server.ts
@@ -14,9 +14,9 @@ export const handle = createSitemapHandle({
 });
 ```
 
-That's it. `/sitemap.xml` is live, your static routes are in there, your blog posts are in there, and it's cached. At 1M URLs the cache is split across 21 chunks served as `/sitemap-1.xml` … `/sitemap-21.xml` behind a `<sitemapindex>`.
+`/sitemap.xml` is now served — static routes and blog posts included, cached. At 1M URLs the output splits across 21 chunks served as `/sitemap-1.xml` … `/sitemap-21.xml` behind a `<sitemapindex>`.
 
-**It's magic.** The main entry point auto-discovers every route in `src/routes/` via the Vite plugin and merges them under your `paths`. You only need to list the entries you want resolvers/groups/custom URLs for.
+The main entry point merges routes auto-discovered from `src/routes/` (via the Vite plugin) with your `paths` config — you only list the entries that need resolvers, groups, or custom URLs.
 
 Don't want the plugin? Don't add it. The lib still works — just supply every URL via `paths` yourself.
 
@@ -222,6 +222,26 @@ export async function POST({ url }) {
 ```
 
 Per-group invalidation is the right call for content systems where one section changes often (blog) and others rarely (docs, customers). Only the dirty group's resolvers re-run and only its chunks get rewritten — the other groups serve from cache. Unknown group names throw at the call site so typos surface immediately.
+
+**Scheduled rebuilds.** `invalidate()` only *marks* the cache stale — the next request pays the rebuild cost. When resolvers are slow (a paginated external API like Shopify), that penalty lands on a crawler. `handle.rebuild()` instead does the work itself, so requests afterwards hit an already-warm cache. Drive it from a cron job hitting a protected endpoint:
+
+```ts
+// src/routes/api/rebuild-sitemap/+server.ts
+import { handle } from '../../../hooks.server';
+import { CRON_SECRET } from '$env/static/private';
+
+export async function POST({ request }) {
+  if (request.headers.get('authorization') !== `Bearer ${CRON_SECRET}`) {
+    return new Response('Unauthorized', { status: 401 });
+  }
+  await handle.rebuild();           // throws → 500 → your cron monitor alerts
+  return new Response(null, { status: 204 });
+}
+```
+
+`rebuild()` runs without a request, so it can't infer the origin — set `config.siteUrl`, or pass `{ siteUrl }`. Pass `{ group }` to rebuild a single group; omit it to rebuild all. It rejects with an `AggregateError` if any group's resolvers throw, but groups that succeeded are still committed — a failed rebuild never corrupts or empties the cache.
+
+`rebuild()` is only useful with an **external cache adapter**: the in-process cache isn't shared across serverless instances, so a cron-warmed in-memory cache wouldn't reach the instances serving requests.
 
 ### 7. i18n
 
@@ -429,6 +449,7 @@ type CacheConfig = {
 | --- | --- |
 | `handle` | The `Handle` itself — drop into `hooks.server.ts`. |
 | `handle.invalidate(group?)` | Clear the cache. Pass a group to invalidate just that group; omit to wipe everything. Async. |
+| `handle.rebuild(options?)` | Proactively rebuild the cache off the request path (for a cron job). Needs an explicit `siteUrl` (config or `options.siteUrl`). Pass `options.group` to rebuild one group. Async. |
 
 ### Plugin options
 

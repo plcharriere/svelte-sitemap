@@ -483,6 +483,123 @@ describe('lastmodPrecision', () => {
 });
 
 // =============================================================================
+// rebuild()
+// =============================================================================
+
+describe('rebuild', () => {
+	it('warms the cache so a later request runs no resolver', async () => {
+		let calls = 0;
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			paths: {
+				'/blog/[id]': () => {
+					calls++;
+					return [{ params: { id: 'a' } }];
+				}
+			}
+		});
+		await h.rebuild();
+		expect(calls).toBe(1);
+		const res = await call(h, '/sitemap.xml');
+		expect(res.headers.get('content-type')).toContain('xml');
+		expect(calls).toBe(1); // served from the cache rebuild() warmed
+	});
+
+	it('throws when no siteUrl is configured and none is passed', async () => {
+		const h = make(['/']);
+		await expect(h.rebuild()).rejects.toThrow(/cannot infer the origin/);
+	});
+
+	it('accepts an explicit siteUrl when config has none', async () => {
+		let calls = 0;
+		const h = createSitemapHandle({
+			paths: {
+				'/blog/[id]': () => {
+					calls++;
+					return [{ params: { id: 'a' } }];
+				}
+			}
+		});
+		await h.rebuild({ siteUrl: 'https://example.com' });
+		expect(calls).toBe(1);
+	});
+
+	it('throws on an invalid explicit siteUrl', async () => {
+		const h = make(['/']);
+		await expect(h.rebuild({ siteUrl: 'not a url' })).rejects.toThrow(/not a valid URL/);
+	});
+
+	it('rebuilds only the named group', async () => {
+		let blog = 0;
+		let news = 0;
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			paths: {
+				'/blog/[id]': {
+					group: 'blog',
+					resolve: () => {
+						blog++;
+						return [{ params: { id: 'a' } }];
+					}
+				},
+				'/news/[id]': {
+					group: 'news',
+					resolve: () => {
+						news++;
+						return [{ params: { id: 'b' } }];
+					}
+				}
+			}
+		});
+		await h.rebuild({ group: 'blog' });
+		expect(blog).toBe(1);
+		expect(news).toBe(0);
+	});
+
+	it('throws on an unknown group', async () => {
+		const h = make(['/'], { siteUrl: 'https://example.com' });
+		await expect(h.rebuild({ group: 'nope' })).rejects.toThrow(/unknown group/);
+	});
+
+	it('rejects if a resolver throws, but other groups still rebuild', async () => {
+		let good = 0;
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			paths: {
+				'/blog/[id]': {
+					group: 'blog',
+					resolve: () => {
+						throw new Error('shopify down');
+					}
+				},
+				'/news/[id]': {
+					group: 'news',
+					resolve: () => {
+						good++;
+						return [{ params: { id: 'b' } }];
+					}
+				}
+			}
+		});
+		await expect(h.rebuild()).rejects.toThrow(/rebuild: 1\/\d+ group/);
+		expect(good).toBe(1); // the healthy group was still committed
+	});
+
+	it('writes through to an external cache adapter', async () => {
+		const adapter = makeAdapter();
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			cache: adapter,
+			paths: { '/blog/[id]': () => [{ params: { id: 'a' } }] }
+		});
+		await h.rebuild();
+		const keys = [...adapter.store.keys()];
+		expect(keys).toContain('meta');
+		expect(keys.some((k) => k.startsWith('chunk:'))).toBe(true);
+	});
+});
+
+// =============================================================================
 // Plugin-less mode (custom paths only, no `routes` field at all)
 // =============================================================================
 
