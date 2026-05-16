@@ -59,6 +59,25 @@ async function call(handle: Handle, pathname: string, origin?: string): Promise<
 }
 
 /**
+ * Like `call`, but supplies a fake `platform.context.waitUntil` that captures
+ * background promises (SWR revalidations). `settled()` awaits them so a test
+ * can assert on the result of the background rebuild deterministically.
+ */
+async function callWithWaitUntil(
+	handle: Handle,
+	pathname: string,
+	origin = 'https://example.com'
+): Promise<{ response: Response; settled: () => Promise<void> }> {
+	const pending: Promise<unknown>[] = [];
+	const event = {
+		url: new URL(origin + pathname),
+		platform: { context: { waitUntil: (p: Promise<unknown>) => pending.push(p) } }
+	} as unknown as RequestEvent;
+	const response = await handle({ event, resolve: fallthroughResolve as never });
+	return { response, settled: () => Promise.all(pending).then(() => {}) };
+}
+
+/**
  * Build a SitemapHandle. `routes` is the legacy "auto-discovered routes"
  * shorthand (what the Vite plugin emits) — merged into `paths` as
  * `{ '/foo': {} }`. `config.paths` overrides on collision so tests can still
@@ -596,6 +615,111 @@ describe('rebuild', () => {
 		const keys = [...adapter.store.keys()];
 		expect(keys).toContain('meta');
 		expect(keys.some((k) => k.startsWith('chunk:'))).toBe(true);
+	});
+});
+
+// =============================================================================
+// stale-while-revalidate
+// =============================================================================
+
+describe('stale-while-revalidate', () => {
+	it('throws at startup on a negative swr', () => {
+		expect(() => make([], { cache: { swr: -5 } })).toThrow(
+			/swr must be a non-negative number/
+		);
+	});
+
+	// Resolver that bumps `calls` only after a delay — lets a test observe that
+	// a response was served *before* the background rebuild's resolver ran.
+	const slowResolver = (counter: { n: number }) => async () => {
+		await new Promise((r) => setTimeout(r, 30));
+		counter.n++;
+		return [{ params: { id: 'a' } }];
+	};
+
+	it('serves stale instantly and rebuilds in the background when configured', async () => {
+		const counter = { n: 0 };
+		const adapter = makeAdapter();
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			cache: { ttl: 3600, swr: 86400, get: adapter.get, set: adapter.set },
+			paths: { '/blog/[id]': slowResolver(counter) }
+		});
+		// First request builds the cache (a genuine miss → awaits the rebuild).
+		await call(h, '/sitemap.xml');
+		expect(counter.n).toBe(1);
+
+		// Force the cached meta stale (expiresAt in the past).
+		(adapter.store.get('meta') as { expiresAt: number }).expiresAt = Date.now() - 1000;
+
+		// Next request must serve XML without waiting on the rebuild.
+		const { response, settled } = await callWithWaitUntil(h, '/sitemap.xml');
+		expect(response.headers.get('content-type')).toContain('xml');
+		expect(counter.n).toBe(1); // responded before the background resolver ran
+
+		await settled();
+		expect(counter.n).toBe(2); // background revalidation completed
+	});
+
+	it('blocks and rebuilds synchronously when swr is not set', async () => {
+		let calls = 0;
+		const adapter = makeAdapter();
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			cache: { ttl: 3600, get: adapter.get, set: adapter.set }, // no SWR
+			paths: {
+				'/blog/[id]': () => {
+					calls++;
+					return [{ params: { id: 'a' } }];
+				}
+			}
+		});
+		await call(h, '/sitemap.xml');
+		expect(calls).toBe(1);
+		(adapter.store.get('meta') as { expiresAt: number }).expiresAt = Date.now() - 1000;
+
+		// Without SWR the stale request rebuilds inline before responding.
+		await call(h, '/sitemap.xml');
+		expect(calls).toBe(2);
+	});
+
+	it('hands the adapter ttl + swr as the eviction TTL', async () => {
+		const ttls: number[] = [];
+		const store = new Map<string, unknown>();
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			cache: {
+				ttl: 100,
+				swr: 900,
+				get: (k) => store.get(k) ?? null,
+				set: (k, v, ttl) => {
+					ttls.push(ttl);
+					store.set(k, v);
+				}
+			},
+			paths: { '/blog/[id]': () => [{ params: { id: 'a' } }] }
+		});
+		await call(h, '/sitemap.xml');
+		expect(ttls.length).toBeGreaterThan(0);
+		expect(ttls.every((t) => t === 1000)).toBe(true); // 100 + 900
+	});
+
+	it('concurrent stale requests share one background rebuild', async () => {
+		const counter = { n: 0 };
+		const adapter = makeAdapter();
+		const h = createSitemapHandle({
+			siteUrl: 'https://example.com',
+			cache: { ttl: 3600, swr: 86400, get: adapter.get, set: adapter.set },
+			paths: { '/blog/[id]': slowResolver(counter) }
+		});
+		await call(h, '/sitemap.xml');
+		(adapter.store.get('meta') as { expiresAt: number }).expiresAt = Date.now() - 1000;
+
+		// Both requests land while the first one's rebuild is still in flight.
+		const a = await callWithWaitUntil(h, '/sitemap.xml');
+		const b = await callWithWaitUntil(h, '/sitemap.xml');
+		await Promise.all([a.settled(), b.settled()]);
+		expect(counter.n).toBe(2); // build + ONE shared revalidation, not two
 	});
 });
 

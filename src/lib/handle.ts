@@ -1,4 +1,4 @@
-import type { Handle } from '@sveltejs/kit';
+import type { Handle, RequestEvent } from '@sveltejs/kit';
 // Star-import so tests can mutate the mocked module's `base`. handle.ts reads
 // it once at handle construction (SvelteKit's `paths.base` is build-time
 // constant in production, so this isn't a hot-path concern).
@@ -43,6 +43,22 @@ function stripBase(pathname: string, base: string): string | null {
 }
 
 type ChunkRequest = { group: string; index: number };
+
+type WaitUntilFn = (promise: Promise<unknown>) => void;
+
+/**
+ * SvelteKit surfaces the platform's background-task primitive at
+ * `event.platform.context.waitUntil` (Cloudflare, Vercel). It keeps the
+ * isolate alive until the promise settles — required for an SWR background
+ * rebuild to finish *after* the response is sent. On a long-lived Node server
+ * there's no such context; the rebuild just runs unawaited and the process
+ * keeps it alive.
+ */
+function getWaitUntil(event: RequestEvent): WaitUntilFn {
+	const ctx = (event.platform as { context?: { waitUntil?: WaitUntilFn } } | undefined)?.context;
+	if (ctx && typeof ctx.waitUntil === 'function') return ctx.waitUntil.bind(ctx);
+	return () => {};
+}
 
 function compileSitemapRegex(basename: string): RegExp {
 	// /{basename}.xml                  → index
@@ -162,7 +178,7 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 	// "configured-but-excluded" warning.
 	const excludeMatchers = resolveExclude(config);
 	validateConfig(config, excludeMatchers);
-	const { ttl, adapter } = resolveCache(config);
+	const { ttl, swr, adapter } = resolveCache(config);
 	const basename = resolveBasename(config);
 	const maxEntries = resolveMaxEntries(config);
 	const externalSitemaps = resolveExternalSitemaps(config);
@@ -173,11 +189,22 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 	// SvelteKit's subpath prefix (`kit.paths.base`). Captured once at handle
 	// construction — it's a build-time constant in production.
 	const base = appPaths.base ?? '';
-	const store = new SitemapStore({ ttl, adapter });
+	const store = new SitemapStore({ ttl, swr, adapter });
 	// Cache-control max-age is floored at 60s — very-short TTLs would otherwise
 	// thrash CDNs without giving meaningful freshness benefit (the origin
 	// rebuild also costs more than the marginal staleness saves).
 	const cacheControlSeconds = Math.max(60, ttl);
+
+	// Build closure bound to a resolved siteUrl. The request path and
+	// `rebuild()` both need one — keeps the BuildContext shape in one place.
+	const makeBuild =
+		(siteUrl: string) =>
+		(groups: Set<string>): Promise<GroupedEntries> =>
+			buildEntries({ siteUrl, base, config, excludeMatchers, lastmodPrecision }, groups);
+
+	// Human-readable known-group list for "unknown group" error messages.
+	const describeGroups = (): string =>
+		[...knownGroups].map((g) => (g === DEFAULT_GROUP ? '(default)' : g)).join(', ');
 
 	const fn: Handle = async ({ event, resolve }) => {
 		// Strip the SvelteKit base prefix before matching. Anything outside
@@ -194,8 +221,28 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 		// `event.url.origin` is always a valid origin string per WHATWG URL —
 		// no need to re-parse it. `staticSiteUrl` was validated at startup.
 		const siteUrl = (staticSiteUrl ?? event.url.origin) + base;
-		const build = (groups: Set<string>): Promise<GroupedEntries> =>
-			buildEntries({ siteUrl, base, config, excludeMatchers, lastmodPrecision }, groups);
+		const build = makeBuild(siteUrl);
+
+		// SWR: when getMeta/getChunk hands back a meta whose `expiresAt` is in
+		// the past, the data was served stale — trigger a background rebuild so
+		// the next request gets fresh data. (A past `expiresAt` only happens
+		// when `swr` is set; otherwise getMeta rebuilds inline
+		// and always returns fresh, so this is a no-op.) `rebuildGroup` dedups
+		// via its inflight map, so concurrent stale requests share one rebuild.
+		const waitUntil = getWaitUntil(event);
+		const revalidateIfStale = (group: string, meta: CachedGroupMeta): void => {
+			if (meta.expiresAt > Date.now()) return;
+			waitUntil(
+				store.rebuildGroup(group, siteUrl, build, maxEntries).then(
+					() => {},
+					(err) =>
+						console.error(
+							`[sitemap] background revalidation failed for group "${group}":`,
+							err
+						)
+				)
+			);
+		};
 
 		if (parsed !== 'index') {
 			// Reject unknown groups *before* triggering any cache work.
@@ -213,6 +260,7 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 				maxEntries
 			);
 			if (!chunk) return new Response('Not found', { status: 404 });
+			revalidateIfStale(parsed.group, meta);
 			return xmlResponse(renderUrlset(chunk.entries), cacheControlSeconds, meta.lastBuilt);
 		}
 
@@ -225,6 +273,10 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 			})
 		);
 		const metas = new Map(metaList);
+
+		// Kick a background rebuild for any group that came back stale (covers
+		// the default group used by the single-chunk shortcut below too).
+		for (const [group, meta] of metas) revalidateIfStale(group, meta);
 
 		// Single chunk in the default group, no externals → render the urlset
 		// directly at /{basename}.xml. Otherwise serve a sitemapindex.
@@ -261,9 +313,7 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 		invalidate: async (group?: string): Promise<void> => {
 			if (group !== undefined && !knownGroups.has(group)) {
 				throw new Error(
-					`[sitemap] invalidate: unknown group "${group}". Known groups: ${[...knownGroups]
-						.map((g) => (g === DEFAULT_GROUP ? '(default)' : g))
-						.join(', ')}.`
+					`[sitemap] invalidate: unknown group "${group}". Known groups: ${describeGroups()}.`
 				);
 			}
 			await store.invalidate(group !== undefined ? [group] : knownGroups);
@@ -289,15 +339,12 @@ export function createSitemapHandle(config: SitemapConfig = {}): SitemapHandle {
 			}
 			if (options.group !== undefined && !knownGroups.has(options.group)) {
 				throw new Error(
-					`[sitemap] rebuild: unknown group "${options.group}". Known groups: ${[...knownGroups]
-						.map((g) => (g === DEFAULT_GROUP ? '(default)' : g))
-						.join(', ')}.`
+					`[sitemap] rebuild: unknown group "${options.group}". Known groups: ${describeGroups()}.`
 				);
 			}
 			// Same siteUrl composition as the request path: (origin) + base.
 			const siteUrl = root.replace(/\/$/, '') + base;
-			const build = (groups: Set<string>): Promise<GroupedEntries> =>
-				buildEntries({ siteUrl, base, config, excludeMatchers, lastmodPrecision }, groups);
+			const build = makeBuild(siteUrl);
 			const targets = options.group !== undefined ? [options.group] : [...knownGroups];
 			const results = await Promise.allSettled(
 				targets.map((g) => store.rebuildGroup(g, siteUrl, build, maxEntries))

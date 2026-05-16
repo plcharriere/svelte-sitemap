@@ -14,7 +14,7 @@ export const handle = createSitemapHandle({
 });
 ```
 
-`/sitemap.xml` is now served — static routes and blog posts included, cached. At 1M URLs the output splits across 21 chunks served as `/sitemap-1.xml` … `/sitemap-21.xml` behind a `<sitemapindex>`.
+`/sitemap.xml` is now served — static routes and blog posts included, cached. At 1M URLs the output splits across 20 chunks served as `/sitemap-1.xml` … `/sitemap-20.xml` behind a `<sitemapindex>`.
 
 The main entry point merges routes auto-discovered from `src/routes/` (via the Vite plugin) with your `paths` config — you only list the entries that need resolvers, groups, or custom URLs.
 
@@ -150,7 +150,7 @@ The bare function form is the shortest and recommended unless you want grouping 
 
 ### 5. Groups
 
-By default all entries share one chunk-numbering sequence: `/sitemap-1.xml`, `/sitemap-2.xml`, ... When you want a section's chunks named explicitly — for SEO reporting, ops clarity, or a future per-group invalidation API — set `group`:
+By default all entries share one chunk-numbering sequence: `/sitemap-1.xml`, `/sitemap-2.xml`, ... When you want a section's chunks named explicitly — for SEO reporting, ops clarity, or per-group invalidation and rebuilds — set `group`:
 
 ```ts
 paths: {
@@ -204,7 +204,24 @@ createSitemapHandle({
 
 The library passes opaque keys (`meta`, `meta:blog`, `chunk:<version>:1`, `chunk:<version>:blog:1`, …) and serializable JSON values. Each group has its own meta key and its own version, so per-group invalidation only touches that group. Namespace however you like in your adapter. Both `get` and `set` are required together; supplying only one is a TypeScript error and a runtime error.
 
-**TTL and freshness.** `ttl` is in **seconds** to match HTTP `Cache-Control: max-age`, Redis `EX`, Cloudflare KV `expirationTtl`, etc. — values pass straight through to your storage's native expiration. The library bakes an absolute `expiresAt` into the cached value at write time, so freshness is enforced regardless of whether your storage honors the TTL. Default: `3600` (1 hour). The HTTP `Cache-Control: max-age` header is set from the same value (clamped at a 60s minimum).
+**TTL and freshness.** `ttl` is in **seconds** to match HTTP `Cache-Control: max-age`, Redis `EX`, Cloudflare KV `expirationTtl`, etc. The library bakes an absolute `expiresAt` into the cached value at write time, so freshness is enforced regardless of whether your storage honors the TTL. Default: `3600` (1 hour). The HTTP `Cache-Control: max-age` header is set from the same value (clamped at a 60s minimum).
+
+**Stale-while-revalidate.** By default, a request arriving after `ttl` has elapsed triggers a *blocking* rebuild — that request waits for the resolvers to finish. For slow resolvers (a paginated external API) that's a multi-second stall. Set `cache.swr` (seconds) and instead the stale sitemap is served **instantly** while the rebuild runs in the background; the request never waits.
+
+```ts
+createSitemapHandle({
+  paths: { ... },
+  cache: {
+    ttl: 3600,                  // fresh for 1h
+    swr: 82800,                 // then serve stale up to 23h more while rebuilding
+    get, set
+  }
+});
+```
+
+Storage keeps each entry for `ttl + swr` (that sum is the TTL handed to your adapter's `set`), so a stale copy always exists to serve — and it's also the longest the sitemap stays servable if rebuilds keep failing. On Cloudflare/Vercel the background rebuild is kept alive via the platform's `waitUntil`; on a long-lived Node server it simply runs after the response. Concurrent stale requests share one rebuild. Omit `swr` to keep the blocking-rebuild behavior.
+
+This pairs naturally with `handle.rebuild()` on a cron: the cron keeps the cache fresh, and `swr` is the safety net that keeps requests fast if a cron tick is ever missed.
 
 **Invalidation.** Call `handle.invalidate()` from a CMS webhook, post-deploy hook, or admin endpoint. Pass a group name to invalidate just that group; omit to wipe everything.
 
@@ -379,13 +396,14 @@ It applies uniformly to per-entry `<lastmod>` and to the `<sitemap>` entries in 
 | `/sitemap-N.xml` | meta + chunk:N | only the requested chunk |
 | `/sitemap-blog-N.xml` | meta + chunk:blog:N | only the requested chunk |
 
-The index serve is **O(1)** in entry count — at 1M URLs / 21 chunks, it's still one KV read.
+The index serve is **O(1)** in entry count — at 1M URLs / 20 chunks, it's still one KV read.
 
 ## Features
 
 - **Auto-discovery** — static routes are picked up from `src/routes/` automatically. Dynamic routes ask for resolvers; missing resolvers are warned, not silently dropped.
 - **Chunked output** — anything past `maxEntries` URLs (default 50K) paginates into `/sitemap-N.xml` files behind a `<sitemapindex>`. Each full-size chunk fits comfortably under Cloudflare KV's 25 MB value cap (~10 MB at the default).
 - **Pluggable cache** — works with any KV that has `get`/`set`. Library handles freshness via embedded `expiresAt`. Inflight dedup ensures concurrent cache misses only trigger one rebuild.
+- **Stale-while-revalidate** — opt into `cache.swr` and a request past the freshness window serves the stale sitemap instantly while a rebuild runs in the background, instead of blocking on it.
 - **Groups** — name the chunks per route family for clarity (`/sitemap-blog-1.xml`) without giving up auto-packing inside each group.
 - **Origin-aware** — `siteUrl` defaults to the request origin, so preview deploys never serve cached prod URLs.
 - **Subpath-aware** — deployed under a `kit.paths.base` prefix? Routing, `<loc>` URLs, and path-mode i18n all compose with the base automatically, no config.
@@ -428,7 +446,8 @@ type ResolverEntry = {
 };
 
 type CacheConfig = {
-  ttl?: number;                 // seconds, default 3600 (1h)
+  ttl?: number;                 // freshness, seconds, default 3600 (1h)
+  swr?: number;                 // serve-stale window, seconds; omit to disable
   get?: (key: string) => MaybePromise<unknown>;
   set?: (key: string, value: unknown, ttl: number) => MaybePromise<void>;
 };
@@ -440,7 +459,7 @@ type CacheConfig = {
 
 | Export | Purpose |
 | --- | --- |
-| `createSitemapHandle(config)` | Returns a SvelteKit `Handle` with an extra `.invalidate()` method. |
+| `createSitemapHandle(config)` | Returns a SvelteKit `Handle` with extra `.invalidate()` and `.rebuild()` methods. |
 | `svelteSitemap(options?)` | Vite plugin (`@plcharriere/svelte-sitemap/vite`). Auto-discovers routes. |
 
 ### Methods on the returned handle
@@ -460,6 +479,6 @@ type CacheConfig = {
 ## Limits and tradeoffs
 
 - **In-memory build** — the resolver returns a single array. At 1M+ entries the array uses ~150 MB during rebuild. Async-generator resolvers are on the roadmap; for now, paginate inside your resolver if you need to.
-- **Cross-instance race** — two server instances rebuilding simultaneously can produce inconsistent reads on the chunk-vs-meta boundary. The library detects and rebuilds rather than serving mixed data, but distributed locks aren't part of the design.
+- **Concurrent rebuilds aren't deduplicated across instances** — the inflight dedup is per-instance, so multiple servers (or serverless isolates) can rebuild the same group at once. This never corrupts or mixes data: each rebuild writes chunks under its own version and commits its meta last, so every read is a coherent snapshot. The cost is duplicate work — a distributed lock would eliminate it, but that's deliberately out of scope.
 - **Optional params (`[[id]]`)** — skipped with a warning. The library doesn't pick a canonical URL for you.
 - **No prerender helper** — the design is runtime-first. If you fully prerender the site, add `/sitemap.xml` and your chunk URLs to `kit.prerender.entries` manually.

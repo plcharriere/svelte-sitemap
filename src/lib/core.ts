@@ -619,10 +619,27 @@ export class SitemapStore {
 	/** Per-group rebuild dedup: concurrent requests for the same group share one rebuild. */
 	private rebuildInflight = new Map<string, Promise<CachedGroupMeta>>();
 	private adapter: CacheAdapter | null;
+	/** Freshness window — drives each entry's `expiresAt`. */
 	private ttlSeconds: number;
+	/** Stale-while-revalidate window in seconds; `0` disables SWR. */
+	private swrSeconds: number;
+	/**
+	 * Storage eviction TTL = freshness + stale window. Handed to the adapter's
+	 * `set` so storage keeps an entry past its freshness deadline — long enough
+	 * to serve it stale while a rebuild runs.
+	 */
+	private evictionTtlSeconds: number;
 
-	constructor(options: { ttl?: number; adapter?: CacheAdapter | null } = {}) {
+	constructor(
+		options: {
+			ttl?: number;
+			swr?: number;
+			adapter?: CacheAdapter | null;
+		} = {}
+	) {
 		this.ttlSeconds = options.ttl ?? DEFAULT_TTL_SECONDS;
+		this.swrSeconds = options.swr ?? 0;
+		this.evictionTtlSeconds = this.ttlSeconds + this.swrSeconds;
 		this.adapter = options.adapter ?? null;
 	}
 
@@ -636,7 +653,7 @@ export class SitemapStore {
 	}
 
 	private async write(key: string, value: unknown): Promise<void> {
-		if (this.adapter) await this.adapter.set(key, value, this.ttlSeconds);
+		if (this.adapter) await this.adapter.set(key, value, this.evictionTtlSeconds);
 		else this.memory.set(key, value);
 	}
 
@@ -680,18 +697,28 @@ export class SitemapStore {
 			return memo.meta;
 		}
 
-		// Cold path: round-trip to storage.
+		// Cold path: round-trip to storage. Empty `version` ⇒ tombstone — never
+		// usable, so it falls through to a rebuild.
 		const cached = await this.read<CachedGroupMeta>(metaKey(group));
 		if (
 			cached &&
 			cached.version &&
 			typeof cached.count === 'number' &&
-			cached.siteUrl === siteUrl &&
-			cached.expiresAt > now
+			cached.siteUrl === siteUrl
 		) {
-			this.metaMemo.set(group, { meta: cached, readAt: now });
-			return cached;
+			if (cached.expiresAt > now) {
+				// Fresh — memo it and serve.
+				this.metaMemo.set(group, { meta: cached, readAt: now });
+				return cached;
+			}
+			if (this.swrSeconds > 0) {
+				// Stale but still within the SWR window (storage hasn't evicted it).
+				// Serve it as-is; the caller sees the past `expiresAt` and triggers
+				// a background rebuild. Not memoed — the memo only holds fresh metas.
+				return cached;
+			}
 		}
+		// Genuine miss, tombstone, or stale with SWR disabled — rebuild now.
 		return this.rebuildGroup(group, siteUrl, build, maxEntries);
 	}
 
@@ -815,6 +842,7 @@ export class SitemapStore {
 
 export function resolveCache(config: SitemapConfig): {
 	ttl: number;
+	swr: number;
 	adapter: CacheAdapter | null;
 } {
 	const cache = config.cache;
@@ -822,18 +850,26 @@ export function resolveCache(config: SitemapConfig): {
 	if (!Number.isFinite(ttl) || ttl < 1) {
 		throw new Error(`[sitemap] cache.ttl must be a positive number of seconds, got ${ttl}.`);
 	}
-	if (!cache) return { ttl, adapter: null };
+	// `0` (or omitted) disables stale-while-revalidate; any positive value is
+	// the stale window in seconds.
+	const swr = cache?.swr ?? 0;
+	if (!Number.isFinite(swr) || swr < 0) {
+		throw new Error(
+			`[sitemap] cache.swr must be a non-negative number of seconds, got ${swr}.`
+		);
+	}
+	if (!cache) return { ttl, swr, adapter: null };
 
 	// Destructure-then-narrow so TS knows `get`/`set` are functions inside
 	// the both-present branch — no `!` assertions needed.
 	const { get, set } = cache;
 	if (typeof get === 'function' && typeof set === 'function') {
-		return { ttl, adapter: { get, set } };
+		return { ttl, swr, adapter: { get, set } };
 	}
 	if (typeof get === 'function' || typeof set === 'function') {
 		throw new Error('[sitemap] cache adapter requires both `get` and `set` to be provided.');
 	}
-	return { ttl, adapter: null };
+	return { ttl, swr, adapter: null };
 }
 
 export function resolveMaxEntries(config: SitemapConfig): number {

@@ -96,18 +96,34 @@ export type CachedChunk = {
 export type CacheAdapter = {
 	get: (key: string) => MaybePromise<unknown>;
 	/**
-	 * Persist a value. `ttl` is the configured TTL in **seconds** — pass it
-	 * straight into your storage's native expiration (Cloudflare KV's
-	 * `expirationTtl`, Redis `EX`, etc.) so eviction stays aligned with the
-	 * library's freshness window.
+	 * Persist a value. `ttl` is in **seconds** — pass it straight into your
+	 * storage's native expiration (Cloudflare KV's `expirationTtl`, Redis `EX`,
+	 * etc.). Note this is the *eviction* TTL: when `swr` is
+	 * configured it is `cache.ttl + cache.swr`, so storage
+	 * keeps an entry past its freshness deadline — long enough to serve it
+	 * stale while a background rebuild runs.
 	 */
 	set: (key: string, value: unknown, ttl: number) => MaybePromise<void>;
 };
 
-// Either both `get` and `set` are provided, or neither — no half-state.
+/**
+ * Cache freshness, optional stale-while-revalidate, and the optional adapter.
+ *
+ * - `ttl` — freshness window in **seconds**; once it elapses the entry is
+ *   stale and due for a rebuild. Default 3600 (1h).
+ * - `swr` — extra window in **seconds**. When set, a stale
+ *   entry is served *immediately* while a rebuild runs in the background,
+ *   instead of the request blocking on the rebuild. Storage keeps the entry
+ *   for `ttl + swr`, so a stale copy exists to serve; that
+ *   sum is also the longest the sitemap stays servable if rebuilds keep
+ *   failing. Omit (or `0`) to disable — a stale entry then blocks on a rebuild.
+ *
+ * Provide `get`+`set` for an external adapter, or neither for the in-process
+ * cache. Supplying just one is rejected.
+ */
 export type CacheConfig =
-	| ({ ttl?: number } & CacheAdapter)
-	| { ttl?: number; get?: never; set?: never };
+	| ({ ttl?: number; swr?: number } & CacheAdapter)
+	| { ttl?: number; swr?: number; get?: never; set?: never };
 
 export type LocaleDef = {
 	domains?: string[];
